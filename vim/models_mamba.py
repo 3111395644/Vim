@@ -35,16 +35,17 @@ __all__ = [
     'vim_tiny_patch16_384', 'vim_small_patch16_384', 'vim_base_patch16_384',
 ]
 
-
+# 图像 → patch tokens（ViT 继承）
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding
     """
     def __init__(self, img_size=224, patch_size=16, stride=16, in_chans=3, embed_dim=768, norm_layer=None, flatten=True):
         super().__init__()
-        img_size = to_2tuple(img_size)
+        img_size = to_2tuple(img_size)#默认正方形图片
         patch_size = to_2tuple(patch_size)
         self.img_size = img_size
         self.patch_size = patch_size
+        # 允许重叠 patch, Mamba 是 局部递归 + 长程建模, 重叠 patch能提供更细粒度的局部连续性, 缓解 SSM 对“突变边界”的敏感性
         self.grid_size = ((img_size[0] - patch_size[0]) // stride + 1, (img_size[1] - patch_size[1]) // stride + 1)
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.flatten = flatten
@@ -56,13 +57,15 @@ class PatchEmbed(nn.Module):
         B, C, H, W = x.shape
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x)
+        x = self.proj(x)# 卷积
         if self.flatten:
-            x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
+            # Image (B, C, H, W) to Sequence (B, M, D)
+            # 此处还涉及扫描顺序的问题，默认是和人类阅读文章一样
+            x = x.flatten(2).transpose(1, 2)  
         x = self.norm(x)
         return x
     
-
+# Mamba Block（残差 + Norm + SSM）
 class Block(nn.Module):
     def __init__(
         self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False,drop_path=0.,
@@ -78,14 +81,32 @@ class Block(nn.Module):
         the hidden_states (output of the mixer) and the residual.
         This is purely for performance reasons, as we can fuse add and LayerNorm.
         The residual needs to be provided (except for the very first block).
+        (hidden_states, residual)
+        ↓
+        (Add residual)
+        ↓
+        Norm
+        ↓
+        Mamba (SSM)
+        ↓
+        (hidden_states', residual')
         """
         super().__init__()
+        """
+        这是 Mamba 系非常重要的稳定性设计：
+
+        hidden_states,可以是 fp16 / bf16
+
+        residual,强制 fp32 累积
+
+        👉 防止 深层 residual 漂移 / 数值下溢
+        """
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
         # import ipdb; ipdb.set_trace()
-        self.mixer = mixer_cls(dim)
-        self.norm = norm_cls(dim)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.mixer = mixer_cls(dim)#核心计算单元,后续重点阅读
+        self.norm = norm_cls(dim)#LayerNorm 或 RMSNorm，prenorm，只作用在residual上
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()#stochastic depth，作用在 residual branch 上
         if self.fused_add_norm:
             assert RMSNorm is not None, "RMSNorm import fails"
             assert isinstance(
@@ -102,9 +123,9 @@ class Block(nn.Module):
             residual: hidden_states = Mixer(LN(residual))
         """
         if not self.fused_add_norm:
-            if residual is None:
+            if residual is None:#第一个Block
                 residual = hidden_states
-            else:
+            else:#后续block
                 residual = residual + self.drop_path(hidden_states)
             
             hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
@@ -133,12 +154,12 @@ class Block(nn.Module):
                     eps=self.norm.eps,
                 )    
         hidden_states = self.mixer(hidden_states, inference_params=inference_params)
-        return hidden_states, residual
+        return hidden_states, residual#residual 是显式状态，并且在 Block 之间传递。
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
-
+# Block 工厂（注入 bimamba / init / ssm_cfg）
 def create_block(
     d_model,
     d_state=16,
@@ -177,7 +198,7 @@ def create_block(
     block.layer_idx = layer_idx
     return block
 
-
+# GPT-2 风格 residual rescale
 # https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
 def _init_weights(
     module,
@@ -210,7 +231,7 @@ def _init_weights(
                 with torch.no_grad():
                     p /= math.sqrt(n_residuals_per_layer * n_layer)
 
-
+# Conv / Linear / Norm 初始化
 def segm_init_weights(m):
     if isinstance(m, nn.Linear):
         trunc_normal_(m.weight, std=0.02)
@@ -225,7 +246,7 @@ def segm_init_weights(m):
         nn.init.zeros_(m.bias)
         nn.init.ones_(m.weight)
 
-
+# 主模型
 class VisionMamba(nn.Module):
     def __init__(self, 
                  img_size=224, 
