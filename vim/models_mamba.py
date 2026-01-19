@@ -92,21 +92,12 @@ class Block(nn.Module):
         (hidden_states', residual')
         """
         super().__init__()
-        """
-        这是 Mamba 系非常重要的稳定性设计：
-
-        hidden_states,可以是 fp16 / bf16
-
-        residual,强制 fp32 累积
-
-        👉 防止 深层 residual 漂移 / 数值下溢
-        """
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
         # import ipdb; ipdb.set_trace()
         self.mixer = mixer_cls(dim)#核心计算单元,后续重点阅读
-        self.norm = norm_cls(dim)#LayerNorm 或 RMSNorm，prenorm，只作用在residual上
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()#stochastic depth，作用在 residual branch 上
+        self.norm = norm_cls(dim)#LayerNorm 或 RMSNorm，prenorm
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()#stochastic depth，后续重点关注
         if self.fused_add_norm:
             assert RMSNorm is not None, "RMSNorm import fails"
             assert isinstance(
@@ -122,18 +113,18 @@ class Block(nn.Module):
             hidden_states: the sequence to the encoder layer (required).
             residual: hidden_states = Mixer(LN(residual))
         """
-        if not self.fused_add_norm:
+        if not self.fused_add_norm:#简单的，显式的
             if residual is None:#第一个Block
                 residual = hidden_states
             else:#后续block
-                residual = residual + self.drop_path(hidden_states)
+                residual = residual + self.drop_path(hidden_states)# Apply stochastic depth to the residual branch (sample-wise block dropping)
             
-            hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
+            hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))# 这里有必要去调查一下norm内部的数据类型
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
-        else:
+        else:#CUDA kernel级优化路径
             fused_add_norm_fn = rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
-            if residual is None:
+            if residual is None:#第一个Block
                 hidden_states, residual = fused_add_norm_fn(
                     hidden_states,
                     self.norm.weight,
@@ -143,7 +134,7 @@ class Block(nn.Module):
                     residual_in_fp32=self.residual_in_fp32,
                     eps=self.norm.eps,
                 )
-            else:
+            else:#后续block
                 hidden_states, residual = fused_add_norm_fn(
                     self.drop_path(hidden_states),
                     self.norm.weight,
@@ -156,26 +147,26 @@ class Block(nn.Module):
         hidden_states = self.mixer(hidden_states, inference_params=inference_params)
         return hidden_states, residual#residual 是显式状态，并且在 Block 之间传递。
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):#支持自回归 / streaming 推理的关键接口。
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
 # Block 工厂（注入 bimamba / init / ssm_cfg）
 def create_block(
-    d_model,
-    d_state=16,
-    ssm_cfg=None,
-    norm_epsilon=1e-5,
-    drop_path=0.,
-    rms_norm=False,
-    residual_in_fp32=False,
-    fused_add_norm=False,
-    layer_idx=None,
-    device=None,
-    dtype=None,
-    if_bimamba=False,
-    bimamba_type="none",
-    if_divide_out=False,
-    init_layer_scale=None,
+    d_model,#模型维度（Block 核心）
+    d_state=16,#Mamba 的 SSM state 维度，mixer_cls
+    ssm_cfg=None,#Mamba 内部参数（算法），mixer_cls
+    norm_epsilon=1e-5,#数值稳定
+    drop_path=0.,#正则化
+    rms_norm=False,#Norm 类型
+    residual_in_fp32=False,#数值精度策略
+    fused_add_norm=False,#性能优化
+    layer_idx=None,#层索引（用于 Mamba），mixer_cls，初始化不同层的time constant，decay / A matrix scale
+    device=None,#工程部署，mixer_cls
+    dtype=None,#工程部署，mixer_cls
+    if_bimamba=False,#Mamba 结构变体，mixer_cls
+    bimamba_type="none",#mixer_cls
+    if_divide_out=False,#输出缩放策略，mixer_cls
+    init_layer_scale=None,#层级缩放（稳定性），mixer_cls
 ):
     if if_bimamba:
         bimamba_type = "v1"
@@ -183,6 +174,7 @@ def create_block(
         ssm_cfg = {}
     factory_kwargs = {"device": device, "dtype": dtype}
     # import ipdb; ipdb.set_trace()
+    # 下面两个是类工厂，并非实例
     mixer_cls = partial(Mamba, d_state=d_state, layer_idx=layer_idx, bimamba_type=bimamba_type, if_divide_out=if_divide_out, init_layer_scale=init_layer_scale, **ssm_cfg, **factory_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
@@ -228,7 +220,7 @@ def _init_weights(
                 # We need to reinit p since this code could be called multiple times
                 # Having just p *= scale would repeatedly scale it down
                 nn.init.kaiming_uniform_(p, a=math.sqrt(5))
-                with torch.no_grad():
+                with torch.no_grad():#这是一次**“参数重写”，不是一次“可学习运算”**
                     p /= math.sqrt(n_residuals_per_layer * n_layer)
 
 # Conv / Linear / Norm 初始化
@@ -249,39 +241,39 @@ def segm_init_weights(m):
 # 主模型
 class VisionMamba(nn.Module):
     def __init__(self, 
-                 img_size=224, 
+                 img_size=224, #决定token形态
                  patch_size=16, 
                  stride=16,
-                 depth=24, 
-                 embed_dim=192, 
-                 d_state=16,
-                 channels=3, 
-                 num_classes=1000,
-                 ssm_cfg=None, 
-                 drop_rate=0.,
-                 drop_path_rate=0.1,
-                 norm_epsilon: float = 1e-5, 
+                 depth=24, #模型深度
+                 embed_dim=192, #token embedding
+                 d_state=16,#SSM
+                 channels=3,#决定token形态 
+                 num_classes=1000,#分类头
+                 ssm_cfg=None,#SSM 
+                 drop_rate=0.,#用在 embedding / pos_embed 后
+                 drop_path_rate=0.1,#Stochastic Depth
+                 norm_epsilon: float = 1e-5, #正则化相关
                  rms_norm: bool = True, 
                  initializer_cfg=None,
-                 fused_add_norm=True,
-                 residual_in_fp32=True,
+                 fused_add_norm=True,#Add + Norm 融合成一个 kernel
+                 residual_in_fp32=True,#residual 精度控制
                  device=None,
                  dtype=None,
                  ft_seq_len=None,
                  pt_hw_seq_len=14,
                  if_bidirectional=False,
                  final_pool_type='none',
-                 if_abs_pos_embed=True,
-                 if_rope=False,
-                 if_rope_residual=False,
-                 flip_img_sequences_ratio=-1.,
-                 if_bimamba=False,
+                 if_abs_pos_embed=True,#绝对位置编码
+                 if_rope=False,#是否启用RoPE
+                 if_rope_residual=False,#是否对residual添加RoPE
+                 flip_img_sequences_ratio=-1.,#以一定概率翻转 token 序列
+                 if_bimamba=False,#是否双向mamba
                  bimamba_type="v2",
-                 if_cls_token=True,
-                 if_divide_out=True,
-                 init_layer_scale=None,
-                 use_double_cls_token=False,
-                 use_middle_cls_token=True,
+                 if_cls_token=True,#是否使用 CLS token
+                 if_divide_out=True,#是否对 Mamba 输出做 scale 防止状态爆炸
+                 init_layer_scale=None,#LayerScale（ViT / ConvNeXt 风格）
+                 use_double_cls_token=False,#头 + 尾 CLS
+                 use_middle_cls_token=True,#CLS 默认插在序列中间
                  **kwargs):
         factory_kwargs = {"device": device, "dtype": dtype}
         # add factory_kwargs into kwargs
@@ -306,10 +298,10 @@ class VisionMamba(nn.Module):
 
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, stride=stride, in_chans=channels, embed_dim=embed_dim)
-        num_patches = self.patch_embed.num_patches
+        num_patches = self.patch_embed.num_patches#图像 → token 序列
 
         if if_cls_token:
-            if use_double_cls_token:
+            if use_double_cls_token:#是否头尾
                 self.cls_token_head = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
                 self.cls_token_tail = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
                 self.num_tokens = 2
@@ -317,11 +309,11 @@ class VisionMamba(nn.Module):
                 self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
                 # self.num_tokens = 1
             
-        if if_abs_pos_embed:
+        if if_abs_pos_embed:#是否绝对位置编码
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, self.embed_dim))
             self.pos_drop = nn.Dropout(p=drop_rate)
 
-        if if_rope:
+        if if_rope:#是否启用RoPE，不加到 embedding，而是在 forward 中对 hidden_states 做旋转
             half_head_dim = embed_dim // 2
             hw_seq_len = img_size // patch_size
             self.rope = VisionRotaryEmbeddingFast(
@@ -329,50 +321,55 @@ class VisionMamba(nn.Module):
                 pt_seq_len=pt_hw_seq_len,
                 ft_seq_len=hw_seq_len
             )
+
+        #分类头
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
 
         # TODO: release this comment
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        # 越深的层，越容易被“随机跳过（Drop）
+        # stochastic depth decay rule，第 0 层几乎不 drop，越往后，drop 概率线性增大
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  
         # import ipdb;ipdb.set_trace()
-        inter_dpr = [0.0] + dpr
+        inter_dpr = [0.0] + dpr#第一个BLOCK不能drop
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
-                # transformer blocks
+
+        # transformer blocks
         self.layers = nn.ModuleList(
             [
                 create_block(
-                    embed_dim,
-                    d_state=d_state,
-                    ssm_cfg=ssm_cfg,
+                    embed_dim,#Block 的输入输出维度
+                    d_state=d_state,#Mamba 的“记忆容量”
+                    ssm_cfg=ssm_cfg,#SSM
                     norm_epsilon=norm_epsilon,
-                    rms_norm=rms_norm,
-                    residual_in_fp32=residual_in_fp32,
-                    fused_add_norm=fused_add_norm,
-                    layer_idx=i,
+                    rms_norm=rms_norm,#RMSNorm（更快、更稳、更适合 FP16）
+                    residual_in_fp32=residual_in_fp32,#主分支可以是 FP16，但残差累加永远在 FP32 中做
+                    fused_add_norm=fused_add_norm,#性能优化
+                    layer_idx=i,#编号
                     if_bimamba=if_bimamba,
                     bimamba_type=bimamba_type,
                     drop_path=inter_dpr[i],
-                    if_divide_out=if_divide_out,
-                    init_layer_scale=init_layer_scale,
+                    if_divide_out=if_divide_out,#在 residual 输出前除以常数，防止层数增加导致幅值爆炸
+                    init_layer_scale=init_layer_scale,#深层网络的“刹车片”。具体算法有待考究
                     **factory_kwargs,
                 )
-                for i in range(depth)
+                for i in range(depth)#Vision Mamba 是 层感知模型，不是“匿名堆叠”。
             ]
         )
         
         # output head
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
             embed_dim, eps=norm_epsilon, **factory_kwargs
-        )
+        )#输出前”的最后一道数值整形关卡。
 
         # self.pre_logits = nn.Identity()
 
         # original init
-        self.patch_embed.apply(segm_init_weights)
-        self.head.apply(segm_init_weights)
+        self.patch_embed.apply(segm_init_weights)#LeCun Normal，bias = 0
+        self.head.apply(segm_init_weights)#trunc_normal_，bias = 0
         if if_abs_pos_embed:
-            trunc_normal_(self.pos_embed, std=.02)
-        if if_cls_token:
+            trunc_normal_(self.pos_embed, std=.02)#可学习bias，trunc_normal_
+        if if_cls_token:#虚拟token，一开始不能太特殊
             if use_double_cls_token:
                 trunc_normal_(self.cls_token_head, std=.02)
                 trunc_normal_(self.cls_token_tail, std=.02)
@@ -380,27 +377,27 @@ class VisionMamba(nn.Module):
                 trunc_normal_(self.cls_token, std=.02)
 
         # mamba init
-        self.apply(
-            partial(
+        self.apply( #递归遍历整个模型的所有 submodule
+            partial(#冻结额外参数，适配 apply 接口
                 _init_weights,
                 n_layer=depth,
                 **(initializer_cfg if initializer_cfg is not None else {}),
             )
         )
 
-
+    #用于流式 / 长序列推理，暂时不用管
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
             i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
             for i, layer in enumerate(self.layers)
         }
 
-    @torch.jit.ignore
-    def no_weight_decay(self):
+    @torch.jit.ignore#不参与 forward，不影响模型结构，只服务于训练 / 权重加载流程
+    def no_weight_decay(self):#告诉优化器：这些参数不要做 weight decay（L2 正则）
         return {"pos_embed", "cls_token", "dist_token", "cls_token_head", "cls_token_tail"}
 
-    @torch.jit.ignore()
-    def load_pretrained(self, checkpoint_path, prefix=""):
+    @torch.jit.ignore()#不参与 forward，不影响模型结构，只服务于训练 / 权重加载流程
+    def load_pretrained(self, checkpoint_path, prefix=""):#加载预训练权重（尤其是 DeiT / ViT / Mamba 变体）
         _load_weights(self, checkpoint_path, prefix)
 
     def forward_features(self, x, inference_params=None, if_random_cls_token_position=False, if_random_token_rank=False):
@@ -410,19 +407,19 @@ class VisionMamba(nn.Module):
         B, M, _ = x.shape
 
         if self.if_cls_token:
-            if self.use_double_cls_token:
+            if self.use_double_cls_token:#双cls token
                 cls_token_head = self.cls_token_head.expand(B, -1, -1)
                 cls_token_tail = self.cls_token_tail.expand(B, -1, -1)
                 token_position = [0, M + 1]
                 x = torch.cat((cls_token_head, x, cls_token_tail), dim=1)
                 M = x.shape[1]
             else:
-                if self.use_middle_cls_token:
+                if self.use_middle_cls_token:#默认路径，CLS 接收到双向上下文
                     cls_token = self.cls_token.expand(B, -1, -1)
                     token_position = M // 2
                     # add cls token in the middle
                     x = torch.cat((x[:, :token_position, :], cls_token, x[:, token_position:, :]), dim=1)
-                elif if_random_cls_token_position:
+                elif if_random_cls_token_position:#随机cls token位置
                     cls_token = self.cls_token.expand(B, -1, -1)
                     token_position = random.randint(0, M)
                     x = torch.cat((x[:, :token_position, :], cls_token, x[:, token_position:, :]), dim=1)
@@ -433,7 +430,7 @@ class VisionMamba(nn.Module):
                     x = torch.cat((cls_token, x), dim=1)
                 M = x.shape[1]
 
-        if self.if_abs_pos_embed:
+        if self.if_abs_pos_embed:#绝对位置编码，默认开启
             # if new_grid_size[0] == self.patch_embed.grid_size[0] and new_grid_size[1] == self.patch_embed.grid_size[1]:
             #     x = x + self.pos_embed
             # else:
@@ -441,8 +438,10 @@ class VisionMamba(nn.Module):
             #                 self.pos_embed, self.patch_embed.grid_size, new_grid_size,0
             #             )
             x = x + self.pos_embed
-            x = self.pos_drop(x)
-
+            x = self.pos_drop(x)#dropout
+        
+        #随机token打乱，验证模型是否依赖固定扫描顺序
+        #如果我随机 permute token，模型还能不能通过 SSM 把信息聚合回来？
         if if_random_token_rank:
 
             # 生成随机 shuffle 索引
@@ -456,7 +455,7 @@ class VisionMamba(nn.Module):
 
             # 执行 shuffle
             x = x[:, shuffle_indices, :]
-
+            # 定位cls token的位置
             if isinstance(token_position, list):
                 # 找到 cls token 在 shuffle 之后的新位置
                 new_token_position = [torch.where(shuffle_indices == token_position[i])[0].item() for i in range(len(token_position))]
@@ -474,7 +473,7 @@ class VisionMamba(nn.Module):
 
 
 
-        if_flip_img_sequences = False
+        if_flip_img_sequences = False#正向扫描，反向扫描
         if self.flip_img_sequences_ratio > 0 and (self.flip_img_sequences_ratio - random.random()) > 1e-5:
             x = x.flip([1])
             if_flip_img_sequences = True
